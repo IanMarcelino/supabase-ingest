@@ -1,0 +1,1 @@
+Deno.serve(() => Response.json({ ok: true, ts: new Date().toISOString() }));
