@@ -1,259 +1,314 @@
 // supabase/functions/ingest_events/index.ts
+// Deno runtime (Supabase Edge). Busca jogos do dia na API-Football e salva via upsert em `ligas`, `times` e `jogos`.
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { DateTime } from "npm:luxon@3";
 
-type LeagueCfg = {
-  slug: string;
-  name: string;
-  provider_league_id: number;
-  default_season: number;
-  season_start?: string;
-  season_end?: string;
+/* ===================== Tipos API ===================== */
+type ApiFootballResponse<T> = {
+  get: string;
+  parameters: Record<string, string>;
+  errors: Record<string, unknown>;
+  results: number;
+  paging: { current: number; total: number };
+  response: T[];
 };
 
-const LEAGUES: Record<string, LeagueCfg> = {
-  "br-serie-a": {
-    slug: "br-serie-a",
-    name: "Brasileirão Série A",
-    provider_league_id: 71,
-    default_season: 2025,
-    season_start: "2025-03-29",
-    season_end:   "2025-12-21",
-  },
-  "br-serie-b": {
-    slug: "br-serie-b",
-    name: "Brasileirão Série B",
-    provider_league_id: 72,
-    default_season: 2025,
-    season_start: "2025-04-04",
-    season_end:   "2025-11-22",
-  },
-  "libertadores": {
-    slug: "libertadores",
-    name: "CONMEBOL Libertadores",
-    provider_league_id: 13,
-    default_season: 2025,
-    season_start: "2025-02-05",
-    season_end:   "2025-09-24",
-  },
-  "ucl": {
-    slug: "ucl",
-    name: "UEFA Champions League",
-    provider_league_id: 2,
-    default_season: 2025,
-    season_start: "2025-07-08",
-    season_end:   "2025-08-27",
-  },
-  "sudamericana": {
-    slug: "sudamericana",
-    name: "CONMEBOL Sudamericana",
-    provider_league_id: 11,
-    default_season: 2025,
-    season_start: "2025-03-05",
-    season_end:   "2025-09-24",
-  },
+type FixtureApi = {
+  fixture: {
+    id: number;
+    referee: string | null;
+    timezone: string;
+    date: string; // ISO
+    timestamp: number; // unix seconds
+    periods: { first: number | null; second: number | null };
+    venue: { id: number | null; name: string | null; city: string | null };
+    status: { long: string; short: string; elapsed: number | null };
+  };
+  league: {
+    id: number;
+    name: string;
+    country: string;
+    logo: string;
+    flag: string | null;
+    season: number;
+    round: string | null;
+  };
+  teams: {
+    home: { id: number; name: string; logo: string; winner: boolean | null };
+    away: { id: number; name: string; logo: string; winner: boolean | null };
+  };
+  goals: { home: number | null; away: number | null };
+  score: unknown;
 };
 
-function todayISO(date?: string) {
-  return (date ? new Date(date) : new Date()).toISOString().slice(0, 10);
+/* ===================== Tipos DB ===================== */
+type UUID = string;
+type MatchStatus = "scheduled" | "in_progress" | "finished" | "canceled" | "postponed";
+
+type JogosInsert = {
+  id_api: string;
+  liga_id: UUID | null;
+  time_casa_id: UUID | null;
+  time_fora_id: UUID | null;
+  estadio: string | null;
+  kickoff_utc: string;        // ISO com offset - será normalizado pelo Postgres (timestamptz)
+  status: MatchStatus;
+  round: string | null;
+  season: string;
+  payload: Record<string, unknown>;
+  updated_at: string;
+  provider: UUID
+  // kickoff_date_brt removido → calculado automaticamente no Postgres
+};
+
+/* ===================== Env & Client ===================== */
+const SB_URL = Deno.env.get("SUPABASE_URL")!;
+const SB_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const API_FOOTBALL_KEY = Deno.env.get("API_FOOTBALL_KEY")!;
+const DEFAULT_LEAGUE = Number(Deno.env.get("DEFAULT_LEAGUE") ?? 71); // Série A
+const DEFAULT_TZ = Deno.env.get("DEFAULT_TZ") ?? "America/Sao_Paulo";
+
+const supabase = createClient(SB_URL, SB_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+/* ===================== Utils ===================== */
+function todayInTZ(tz: string) {
+  return DateTime.now().setZone(tz).toFormat("yyyy-LL-dd"); // YYYY-MM-DD
 }
 
-function toBRTDate(isoUtc: string): string {
-  const dt = new Date(isoUtc);
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Sao_Paulo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return fmt.format(dt);
+function toISOWithZoneFromUnix(tsSec: number, tz: string) {
+  return DateTime.fromSeconds(tsSec).setZone(tz).toISO({ suppressMilliseconds: true })!;
 }
 
-function mapStatus(short: string | null | undefined): string {
-  const s = (short || "").toUpperCase();
-  if (s === "PST") return "postponed";
-  if (s === "CANC" || s === "ABD") return "canceled";
-  if (s === "FT" || s === "AET" || s === "PEN") return "finished";
-  if (["1H", "HT", "2H", "ET", "P"].includes(s)) return "live";
-  return "scheduled";
+function slugify(s: string | null | undefined) {
+  const base = (s ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)+/g, "");
 }
 
-function slugifyName(name?: string | null) {
-  const base = (name ?? "")
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return base || null;
+function mapStatus(apiShort: string): MatchStatus {
+  switch (apiShort) {
+    case "NS": return "scheduled";
+    case "1H":
+    case "2H":
+    case "HT":
+    case "ET":
+    case "BT":
+    case "P":  return "in_progress";
+    case "FT":
+    case "AET":
+    case "PEN": return "finished";
+    case "CANC":
+    case "ABD": return "canceled";
+    case "PST": return "postponed";
+    default:    return "scheduled";
+  }
 }
 
+/* ===================== Fetch fixtures ===================== */
+async function fetchFixturesSmart(url: string, headers: HeadersInit) {
+  const fixtures: FixtureApi[] = [];
+
+  const r0 = await fetch(url, { headers });
+  const t0 = await r0.text();
+  if (!r0.ok) throw new Error(`API-Football error ${r0.status}: ${t0}`);
+  const j0 = JSON.parse(t0) as ApiFootballResponse<FixtureApi>;
+
+  const hasErrors = j0?.errors && Object.keys(j0.errors).length > 0;
+  fixtures.push(...(j0.response ?? []));
+
+  const total = j0?.paging?.total ?? 1;
+  if (total > 1) {
+    for (let page = 2; page <= total; page++) {
+      const u = new URL(url);
+      u.searchParams.set("page", String(page));
+      const rp = await fetch(u.toString(), { headers });
+      const tp = await rp.text();
+      if (!rp.ok) throw new Error(`API-Football error ${rp.status}: ${tp}`);
+      const jp = JSON.parse(tp) as ApiFootballResponse<FixtureApi>;
+      fixtures.push(...(jp.response ?? []));
+    }
+  }
+
+  return { fixtures, firstJson: j0, hasErrors };
+}
+
+/* ===================== Upserts auxiliares ===================== */
+async function ensureLeagueId(lg: FixtureApi["league"]): Promise<UUID> {
+  const id_api = String(lg.id);
+  const row = {
+    id_api,
+    name: lg.name ?? null,
+    slug: slugify(lg.name ?? null),
+    country: lg.country ?? null,
+    updated_at: DateTime.now().toISO(),
+    provider: "api-football",
+  };
+
+  const { data, error } = await supabase
+    .from("ligas")
+    .upsert(row, { onConflict: "id_api" })
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  return data.id as UUID;
+}
+
+async function ensureTeamId(t: FixtureApi["teams"]["home"]): Promise<UUID> {
+  const id_api = String(t.id);
+  const row = {
+    id_api,
+    name: t.name ?? null,
+    slug: slugify(t.name ?? null),
+    logo_url: t.logo ?? null,
+    updated_at: DateTime.now().toISO(),
+    provider: "api-football",
+  };
+
+  const { data, error } = await supabase
+    .from("times")
+    .upsert(row, { onConflict: "id_api" })
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  return data.id as UUID;
+}
+
+/* ===================== Upsert jogos ===================== */
+async function upsertJogos(rows: JogosInsert[]) {
+  if (rows.length === 0) return { created: 0, updated: 0 };
+
+  const ids = rows.map((r) => r.id_api);
+  const { data: existing, error: selErr } = await supabase
+    .from("jogos")
+    .select("id_api")
+    .in("id_api", ids);
+
+  if (selErr) throw selErr;
+
+  const existingSet = new Set((existing ?? []).map((e) => e.id_api as string));
+  const toInsert = rows.filter((r) => !existingSet.has(r.id_api));
+  const toUpdate = rows.filter((r) => existingSet.has(r.id_api));
+
+  const { error: upErr } = await supabase
+    .from("jogos")
+    .upsert(rows, { onConflict: "id_api" });
+  if (upErr) {
+    if (toInsert.length) {
+      const { error } = await supabase.from("jogos").insert(toInsert);
+      if (error) throw error;
+    }
+    for (const r of toUpdate) {
+      const { error } = await supabase.from("jogos").update(r).eq("id_api", r.id_api);
+      if (error) throw error;
+    }
+  }
+
+  return { created: toInsert.length, updated: toUpdate.length };
+}
+
+/* ===================== Handler ===================== */
 Deno.serve(async (req) => {
-  // Auth por header (opcional em DEV)
-  const SKIP = Deno.env.get("SKIP_CRON_SECRET") === "1";
-  if (!SKIP) {
-    const expected = Deno.env.get("CRON_SECRET");
-    const got = req.headers.get("x-cron-secret");
-    if (!expected || got !== expected) {
-      return new Response("unauthorized", { status: 401 });
-    }
-  }
-
-  const SUPABASE_URL = Deno.env.get("SB_URL");
-  const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SB_SERVICE_ROLE_KEY");
-  const APIFOOTBALL_API_KEY = Deno.env.get("APIFOOTBALL_API_KEY"); // <<< NOVA ENV
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    return new Response("missing Supabase env", { status: 500 });
-  }
-  if (!APIFOOTBALL_API_KEY) {
-    return new Response("missing APIFOOTBALL_API_KEY", { status: 500 });
-  }
-
-  const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false },
-  });
-
   try {
+    if (!API_FOOTBALL_KEY) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Missing API_FOOTBALL_KEY" }),
+        { status: 500, headers: { "content-type": "application/json" } },
+      );
+    }
+
     const url = new URL(req.url);
-    const leagueSlug = url.searchParams.get("league") ?? "br-serie-a";
-    const baseDate = url.searchParams.get("date") ?? todayISO();
-    const daysAhead = Number(url.searchParams.get("days_ahead") ?? "0");
-    const seasonOverride = url.searchParams.get("season");
+    const leagueParam = url.searchParams.get("league");
+    const seasonParam = url.searchParams.get("season");
+    const dateParam = url.searchParams.get("date") ?? new Date().toISOString().slice(0, 10);
+    const tz = url.searchParams.get("timezone") || DEFAULT_TZ;
+    const debugFlag = url.searchParams.has("debug");
 
-    const cfg = LEAGUES[leagueSlug];
-    if (!cfg) {
-      return new Response(JSON.stringify({ error: `unknown league '${leagueSlug}'` }), { status: 400 });
+    const league =
+      leagueParam && /^\d+$/.test(leagueParam)
+        ? Number(leagueParam)
+        : DEFAULT_LEAGUE;
+
+    const season =
+      seasonParam && /^\d{4}$/.test(seasonParam)
+        ? Number(seasonParam)
+        : (dateParam
+            ? DateTime.fromISO(`${dateParam}T00:00:00`, { zone: tz }).year
+            : DateTime.now().setZone(tz).year);
+
+    const date = dateParam || todayInTZ(tz);
+
+    const base = "https://v3.football.api-sports.io/fixtures";
+    const apiUrl = `${base}?league=${league}&season=${season}&date=${date}&timezone=${encodeURIComponent(tz)}`;
+    const headers = { "x-apisports-key": API_FOOTBALL_KEY };
+
+    const { fixtures, firstJson, hasErrors } = await fetchFixturesSmart(apiUrl, headers);
+
+    if (hasErrors) {
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          reason: "upstream_error",
+          status: 200,
+          api_errors: firstJson?.errors ?? null,
+          last_url: apiUrl,
+          ...(debugFlag ? {
+            api_key_len: API_FOOTBALL_KEY?.length ?? 0,
+            api_key_tail: API_FOOTBALL_KEY ? API_FOOTBALL_KEY.slice(-6) : null,
+          } : {}),
+        }),
+        { status: 502, headers: { "content-type": "application/json" } },
+      );
     }
-    const season = Number(seasonOverride ?? cfg.default_season);
 
-    // janela [from..to]
-    const from = new Date(baseDate);
-    const to = new Date(baseDate);
-    to.setUTCDate(to.getUTCDate() + Math.max(0, daysAhead));
+    const rows: JogosInsert[] = [];
+    for (const fx of fixtures) {
+      const ligaId = await ensureLeagueId(fx.league);
+      const homeId = await ensureTeamId(fx.teams.home);
+      const awayId = await ensureTeamId(fx.teams.away);
 
-    let fromStr = from.toISOString().slice(0, 10);
-    let toStr = to.toISOString().slice(0, 10);
+      rows.push({
+        id_api: String(fx.fixture.id),
+        liga_id: ligaId,
+        time_casa_id: homeId,
+        time_fora_id: awayId,
 
-    // Sanidade opcional: limitar à janela real da competição, se informada
-    if (cfg.season_start && fromStr < cfg.season_start) fromStr = cfg.season_start;
-    if (cfg.season_end && toStr > cfg.season_end) toStr = cfg.season_end;
-
-    // garante liga (onConflict por slug)
-    const { data: liga, error: ligaErr } = await sb
-      .from("ligas")
-      .upsert(
-        {
-          slug: cfg.slug,
-          name: cfg.name,
-          id_api: `apisports:${cfg.provider_league_id}`,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "slug" }
-      )
-      .select("id, slug")
-      .single();
-    if (ligaErr) throw ligaErr;
-    if (!liga?.id) throw new Error("Falha ao garantir 'ligas'");
-
-    let created = 0, updated = 0, skipped = 0;
-
-    let page = 1;
-    while (true) {
-      const apiUrl = new URL("https://v3.football.api-sports.io/fixtures");
-      apiUrl.searchParams.set("league", String(cfg.provider_league_id));
-      apiUrl.searchParams.set("season", String(season));
-      apiUrl.searchParams.set("from", fromStr);
-      apiUrl.searchParams.set("to", toStr);
-      apiUrl.searchParams.set("page", String(page));
-
-      const res = await fetch(apiUrl.toString(), {
-        headers: { "x-apisports-key": APIFOOTBALL_API_KEY },
+        estadio: fx.fixture.venue.name ?? null,
+        kickoff_utc: toISOWithZoneFromUnix(fx.fixture.timestamp, tz),
+        status: mapStatus(fx.fixture.status.short ?? ""),
+        round: fx.league.round ?? null,
+        season: String(fx.league.season),
+        payload: fx as unknown as Record<string, unknown>,
+        updated_at: DateTime.now().toISO(),
+        provider: "api-football",
+        // kickoff_date_brt removido → calculado pelo Postgres
       });
-      if (!res.ok) {
-        throw new Error(`API-FOOTBALL ${res.status} for ${cfg.name} ${fromStr}..${toStr}`);
-      }
-      const json = await res.json() as any;
-
-      const items = json?.response ?? [];
-      if (!items.length && page === 1) break;
-
-      for (const it of items) {
-        const fixture = it.fixture ?? {};
-        const leagueInfo = it.league ?? {};
-        const teams = it.teams ?? {};
-        const home = teams.home ?? {};
-        const away = teams.away ?? {};
-
-        // teams upsert
-        const teamsToUpsert: Array<{ id_api: number | null; name: string | null }> = [
-          { id_api: home.id ?? null, name: home.name ?? null },
-          { id_api: away.id ?? null, name: away.name ?? null },
-        ];
-        const teamIds: Record<string, string> = {};
-
-        for (const t of teamsToUpsert) {
-          if (!t.id_api) continue;
-          const slug = slugifyName(t.name);
-          const { data: teamRow, error: teamErr } = await sb
-            .from("times")
-            .upsert(
-              { id_api: String(t.id_api), name: t.name, slug, updated_at: new Date().toISOString() },
-              { onConflict: "id_api" }
-            )
-            .select("id, id_api")
-            .single();
-          if (teamErr) throw teamErr;
-          if (teamRow?.id) teamIds[String(t.id_api)] = teamRow.id;
-        }
-
-        // horário e status
-        const kickoffUtc: string | null = fixture.date ? new Date(fixture.date).toISOString() : null;
-        const statusShort: string | null = fixture.status?.short ?? null;
-        const status = mapStatus(statusShort);
-
-        // jogo upsert
-        const payload = {
-          id_api: fixture.id ? String(fixture.id) : null,
-          liga_id: liga.id as string,
-          time_casa_id: home.id ? (teamIds[String(home.id)] ?? null) : null,
-          time_fora_id: away.id ? (teamIds[String(away.id)] ?? null) : null,
-          estadio: fixture.venue?.name ?? null,
-          kickoff_utc: kickoffUtc,
-          status,
-          round: leagueInfo.round ?? null,
-          season: leagueInfo.season ?? season,
-          payload: it ?? null,
-          updated_at: new Date().toISOString(),
-          kickoff_date_brt: kickoffUtc ? toBRTDate(kickoffUtc) : null,
-        };
-
-        if (!payload.id_api) { skipped++; continue; }
-
-        const { data: up, error: upErr } = await sb
-          .from("jogos")
-          .upsert(payload, { onConflict: "id_api" })
-          .select("id, created_at, updated_at")
-          .single();
-        if (upErr) throw upErr;
-
-        if (up?.created_at && (up?.created_at === up?.updated_at || !up?.updated_at)) created++;
-        else updated++;
-      }
-
-      const curr = Number(json?.paging?.current ?? page);
-      const total = Number(json?.paging?.total ?? page);
-      if (!Number.isFinite(curr) || !Number.isFinite(total) || curr >= total) break;
-      page = curr + 1;
     }
 
-    return new Response(JSON.stringify({ ok: true, created, updated, skipped }), {
-      headers: { "content-type": "application/json" },
-    });
+    const summary = await upsertJogos(rows);
+
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        ...summary,
+        debug: {
+          query: { league, season, date, timezone: tz },
+          count_api: fixtures.length,
+          last_url: apiUrl,
+          ...(debugFlag ? {
+            api_key_len: API_FOOTBALL_KEY?.length ?? 0,
+            api_key_tail: API_FOOTBALL_KEY ? API_FOOTBALL_KEY.slice(-6) : null,
+          } : {}),
+        },
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
   } catch (e) {
-  console.error("ingest_events error:", e);
-  const msg =
-    e instanceof Error
-      ? `${e.message}${e.stack ? " | " + e.stack : ""}`
-      : JSON.stringify(e);  
-  return new Response(JSON.stringify({ error: msg }), { status: 500 });
-}
-  
+    return new Response(
+      JSON.stringify({ ok: false, error: String(e?.message ?? e) }),
+      { status: 500, headers: { "content-type": "application/json" } },
+    );
+  }
 });
