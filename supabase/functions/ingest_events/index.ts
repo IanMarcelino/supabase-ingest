@@ -58,7 +58,7 @@ type JogosInsert = {
   payload: Record<string, unknown>;
   updated_at: string;
   provider: UUID
-  // kickoff_date_brt removido → calculado automaticamente no Postgres
+  
 };
 
 /* ===================== Env & Client ===================== */
