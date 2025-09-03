@@ -230,7 +230,7 @@ Deno.serve(async (req) => {
       leagueParam && /^\d+$/.test(leagueParam)
         ? Number(leagueParam)
         : DEFAULT_LEAGUE;
-
+  
     const season =
       seasonParam && /^\d{4}$/.test(seasonParam)
         ? Number(seasonParam)

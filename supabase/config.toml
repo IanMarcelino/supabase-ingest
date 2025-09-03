@@ -635,30 +635,6 @@ verify_jwt = true
 
 import_map = "./functions/ingest_events/deno.json"
 
-
-[functions.ingest_events.schedules]
-
-# Série A
-
-serie_a = { schedule = "0 9 * * *", endpoint = "/functions/v1/ingest_events?league=71" }
-
-
-# Champions League
-
-ucl = { schedule = "5 9 * * *", endpoint = "/functions/v1/ingest_events?league=2" }
-
-
-# Libertadores
-
-libertadores = { schedule = "10 9 * * *", endpoint = "/functions/v1/ingest_events?league=13" }
-
-
-# Sul-Americana
-
-sula = { schedule = "15 9 * * *", endpoint = "/functions/v1/ingest_events?league=45" }
-
-
-
 [functions.ping]
 
 enabled = true
